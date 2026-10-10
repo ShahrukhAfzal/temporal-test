@@ -1,0 +1,2 @@
+"""Minimal Temporal Python application."""
+
