@@ -1,95 +1,82 @@
-# Temporal Python examples
+# Temporal microservices orchestration POC
 
-This project contains a small greeting example and a multi-step order example.
+A learning POC: OMS starts a real Temporal workflow; a separate worker executes HTTP activities against independent OMS, Inventory, WMS and TMS services. No application database, Redis, broker or external API is used. Mock idempotency and business state live only in each service's memory.
 
-The order example uses one parent and four child workflows. Three independent
-children run in parallel, and shipping begins only after all three succeed:
+## Run it
 
-```text
-OrderWorkflow
-├── validate_order activity
-├── parallel stage
-│   ├── PaymentWorkflow
-│   │   └── charge_payment activity
-│   ├── InventoryWorkflow
-│   │   └── reserve_inventory activity
-│   └── CustomerVerificationWorkflow
-│       └── verify_customer activity
-├── wait for payment_completed signal
-├── ShippingWorkflow (after the parallel stage)
-│   └── create_shipment activity
-└── send_confirmation activity
+From this directory run `docker compose up --build`. OMS is at `http://localhost:8001`, Inventory at `:8002`, WMS at `:8003`, TMS at `:8004`, Temporal gRPC at `:7233`, and Temporal UI at `http://localhost:8233`.
+
+Create an order:
+
+```sh
+curl -X POST http://localhost:8001/orders -H 'content-type: application/json' -d '{"order_id":"ORD-1001","sku":"SKU-101","quantity":2}'
 ```
 
-Set `simulate_shipping_failure=True` on an `OrderRequest` to see the shipping
-activity fail and retry three times. Normal sample orders leave it disabled.
+Expected immediate response: `{"order_id":"ORD-1001","workflow_id":"order-ORD-1001","status":"WORKFLOW_STARTED"}`. Repeating that ID returns HTTP 409 rather than starting a duplicate. Omit `order_id` to have OMS generate one. Query progress with `curl http://localhost:8001/orders/ORD-1001/workflow`.
 
-## Set up
+## What Temporal does
 
-The virtual environment and Python SDK are installed in `.venv`. A project-local
-Temporal CLI is installed in `.tools/temporal` (and ignored by Git).
-
-Start a local Temporal development server in a separate terminal:
-
-```powershell
-.\.tools\temporal\temporal.exe server start-dev
+```mermaid
+flowchart LR
+  C[Client] --> OMS[OMS :8001]
+  OMS -->|start workflow| TS[Temporal Server :7233]
+  TS -->|task queue: orders| W[Orchestrator Worker]
+  W -->|HTTP Activities| I[Inventory :8002]
+  W -->|HTTP Activities| WH[WMS :8003]
+  W -->|HTTP Activities| T[TMS :8004]
+  W -->|HTTP Activities| OMS
 ```
 
-Then start the worker:
+The server stores workflow history and schedules tasks; it does not run Python business code. A worker polls the `orders` task queue, replays deterministic workflow code from history, and runs activity code. A workflow is the durable sequence and its queryable progress. Activities do HTTP and can be retried. Workflow code contains no network calls or nondeterministic work.
 
-```powershell
-.\.venv\Scripts\python.exe -m temporal_app.worker
+The workflow reserves inventory, fulfills at WMS, creates a TMS shipment and marks OMS complete. The default activity policy is 1 second initial delay, coefficient 2, 10 second maximum interval and 3 attempts. Each attempt has a 30 second start-to-close timeout and a 100 second schedule-to-close limit. HTTPX itself does not retry; its timeout defaults to 25 seconds. HTTP 5xx, network errors and timeouts become retryable `DownstreamError` application failures. HTTP 422 becomes non-retryable `BusinessError`.
+
+After an exhausted forward failure, Saga compensation runs in reverse: cancel TMS if created, cancel WMS if fulfilled, release inventory if reserved, then mark the OMS order failed. Each successful forward step is registered immediately. Compensation records success or failure in the query result; a failure leaves `COMPENSATION_INCOMPLETE`, not a false rollback claim. Compensation currently shares the bounded retry policy.
+
+Temporal provides durable workflow history, not exactly-once HTTP execution. The services accept a deterministic `operation_id`, and repeated successful requests return the prior result. A timeout can happen after a service has committed: retry uses the same operation ID, gets the stored response, and avoids a second effect. This in-memory idempotency is lost when that service restarts; production needs durable idempotency and, where needed, an operation-status reconciliation API.
+
+The development server is configured with a mounted file for its local history. It is for this POC, not a production durability or backup design. Worker failure pauses task execution; restart the worker and Temporal replays history to continue. Temporal Server failure interrupts orchestration availability. Downstream failure makes an activity fail/retry. HTTP timeout means the response missed its deadline and the remote outcome can be ambiguous. Activity failure is not immediately workflow failure: it may retry first. Workflow failure occurs when workflow code fails or an activity's retry policy is exhausted and compensation finishes.
+
+## Inject failures
+
+All services expose `POST /admin/failure`, `POST /admin/reset`, and `GET /admin/state`. Configure the operation path name (`reserve`, `release`, `fulfill`, `cancel`, `shipments`, `shipments/cancel`). Modes: `none`, `http_500`, `http_503`, `fail_n_times`, `timeout`, `delay`, `business_error`, `connection_drop`. `connection_drop` is approximated as HTTP 503; reliably dropping sockets is not implemented. Service logs include operation ID, attempt and injected mode.
+
+Transient inventory failure twice, then success:
+
+```sh
+curl -X POST localhost:8002/admin/failure -H 'content-type: application/json' -d '{"operation":"reserve","mode":"fail_n_times","fail_count":2}'
+curl -X POST localhost:8001/orders -H 'content-type: application/json' -d '{"order_id":"ORD-retry","quantity":1}'
+curl localhost:8002/admin/state
 ```
 
-In another terminal, start the order workflow. It prints its generated workflow
-ID and then durably waits for payment confirmation:
+Permanent WMS failure (inventory should be released):
 
-```powershell
-.\.venv\Scripts\python.exe -m temporal_app.order_starter
+```sh
+curl -X POST localhost:8003/admin/failure -H 'content-type: application/json' -d '{"operation":"fulfill","mode":"business_error"}'
+curl -X POST localhost:8001/orders -H 'content-type: application/json' -d '{"order_id":"ORD-business","quantity":1}'
+curl localhost:8002/admin/state
 ```
 
-Copy the workflow ID and expected payment ID from that terminal. In a fourth
-terminal, send the signal (replace the sample values with the printed ones):
+TMS unavailable after bounded attempts (WMS cancellation, then inventory release):
 
-```powershell
-.\.venv\Scripts\python.exe -m temporal_app.signal_payment order-ab12cd34 pay-order-ab12cd34
+```sh
+curl -X POST localhost:8004/admin/failure -H 'content-type: application/json' -d '{"operation":"shipments","mode":"http_503"}'
+curl -X POST localhost:8001/orders -H 'content-type: application/json' -d '{"order_id":"ORD-tms","quantity":1}'
 ```
 
-The starter terminal then prints the completed result. To exercise the same
-flow with one client, ask it to signal automatically after two seconds:
+Timeout after the first commit; set service delay to 15 seconds, greater than the activity HTTP timeout. Retry is idempotent:
 
-```powershell
-.\.venv\Scripts\python.exe -m temporal_app.order_starter --auto-signal-after 2
+```sh
+curl -X POST localhost:8002/admin/failure -H 'content-type: application/json' -d '{"operation":"reserve","mode":"timeout"}'
+curl -X POST localhost:8001/orders -H 'content-type: application/json' -d '{"order_id":"ORD-timeout","quantity":1}'
 ```
 
-Open Temporal UI at `http://localhost:8233`, select the order workflow, and
-inspect its Event History. Before signaling, the workflow remains Running and
-its `payment_status` query returns `WAITING_FOR_PAYMENT_CONFIRMATION`. After the
-signal, look for `WorkflowExecutionSignaled`, followed by the shipping child
-workflow events and final completion. The payment, inventory, and customer
-verification child workflows still appear as parallel child executions before
-the signal gate.
+Other modes use the same body; `delay` accepts `delay_seconds`. Reset a service with `curl -X POST localhost:8002/admin/reset`. State includes attempts and in-memory business state.
 
-Or run the smaller greeting workflow:
+To exercise worker recovery, configure WMS `fulfill` with `delay` and `delay_seconds:20`, start an order, stop the `orchestrator` container while it is running (`docker compose stop orchestrator`), then restart it (`docker compose start orchestrator`). Find the same workflow ID in the UI and inspect its event history. Worker restart preserves Temporal history; restarting mock services clears their local state.
 
-```powershell
-.\.venv\Scripts\python.exe -m temporal_app.starter
-```
+In the UI, open the workflow to inspect scheduled/started/completed activity events, retries, failures, workflow status and compensation activities. Use `docker compose logs -f orchestrator inventory wms tms oms` to correlate activity and service logs. Temporal is task/history orchestration; unlike Kafka, this example is not a durable event-broker/pub-sub integration.
 
-Expected output:
+## Local test
 
-```text
-Hello, Temporal!
-```
-
-The sample order is defined in `temporal_app/order_starter.py`. It generates a
-new order ID each time so you can run it repeatedly against the same server.
-
-## Test
-
-The test uses Temporal's ephemeral test server, so it does not need a separately
-running local server:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -v
-```
+Python 3.11+: `pip install -r requirements.txt`, then `python -m unittest tests.test_orchestration_poc -v`. This test starts Temporal's real ephemeral test server and runs the actual workflow. For the complete HTTP/retry/compensation scenarios, run Compose and use the curl examples above. Docker was unavailable in the build environment, so Compose startup was not verified here.

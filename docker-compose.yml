@@ -1,0 +1,47 @@
+services:
+  temporal:
+    image: temporalio/temporal:latest
+    command: server start-dev --ip 0.0.0.0 --ui-port 8233 --db-filename /data/temporal.db
+    ports: ["7233:7233", "8233:8233"]
+    volumes: ["temporal-data:/data"]
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  oms:
+    build: .
+    command: uvicorn oms.main:app --host 0.0.0.0 --port 8001
+    ports: ["8001:8001"]
+    environment: {TEMPORAL_ADDRESS: temporal:7233}
+    depends_on: {temporal: {condition: service_healthy}}
+    healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/docs')"], interval: 5s, timeout: 3s, retries: 10}
+  inventory:
+    build: .
+    command: uvicorn inventory.main:app --host 0.0.0.0 --port 8002
+    ports: ["8002:8002"]
+  wms:
+    build: .
+    command: uvicorn wms.main:app --host 0.0.0.0 --port 8003
+    ports: ["8003:8003"]
+  tms:
+    build: .
+    command: uvicorn tms.main:app --host 0.0.0.0 --port 8004
+    ports: ["8004:8004"]
+  orchestrator:
+    build: .
+    command: python -m orchestrator.worker
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      OMS_URL: http://oms:8001
+      INVENTORY_URL: http://inventory:8002
+      WMS_URL: http://wms:8003
+      TMS_URL: http://tms:8004
+    depends_on:
+      temporal: {condition: service_healthy}
+      oms: {condition: service_healthy}
+      inventory: {condition: service_started}
+      wms: {condition: service_started}
+      tms: {condition: service_started}
+volumes:
+  temporal-data:
